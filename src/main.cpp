@@ -1,40 +1,25 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include "config.h"
+
+// ----------------------------
+// Custom libraries
+// ----------------------------
 #include <NetworkManager.h>
 #include <WiFi/WiFiNetworkManager.h>
 #include <HTTP/PostLogHttp.h>
 #include <RumpshiftLogger.h>
-#include <WiFi.h>
-#include <ArduinoJson.h>
-#include <WiFiUdp.h>   // Needed for NTP
-#include <NTPClient.h> // Needed for NTP
-#include <time.h>
-#include "config.h"
-
-// ----------------------------
-// Function Declarations
-// ----------------------------
-void sendLog();
-String getUTCTimeISO();
-
-// ----------------------------
-// NTP / Time Setup
-// ----------------------------
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // UTC, refresh every 60s
-String startTimeISO;                                    // Start timestamp captured at setup
-
-// ----------------------------
-// Pin Definitions
-// ----------------------------
-const int SENSOR_PIN = 2; // Transistor collector → D2
-const int RESET_PIN = 4;  // Button to send log → D4
+#include <TimeHelper.h>
+#include <PinManager.h>
+#include <Boards/UnoR4WiFi.h>
 
 // ----------------------------
 // State Variables
 // ----------------------------
 unsigned long itemCount = 0; // Current item count
-bool lastState = HIGH;       // Last sensor state for edge detection
-bool lastResetState = HIGH;  // Last reset button state
+bool lastSensorState = HIGH; // For edge detection
+bool lastResetState = HIGH;  // For reset button
 
 // ----------------------------
 // WiFi & Network Setup
@@ -42,40 +27,62 @@ bool lastResetState = HIGH;  // Last reset button state
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASS;
 const char *server = LAN_IP;
-const int port = 8000;
+constexpr int port = 8000;
 
-// Initialize logger, network manager, and HTTP logger
+// Initialize logger
 RumpshiftLogger logger(BAUD_RATE, DEBUG_LEVEL, true);
+
+// Initialize network manager and HTTP logger
 NetworkManager *network = new WiFiNetworkManager(ssid, password, &logger);
 PostLogHttp postHttpLogger(*network, &logger, API_PATH, false);
+
+// ----------------------------
+// Pin Manager
+// ----------------------------
+PinManager pinManager(&logger);
+
+// Logical pin constants (will be assigned in setup)
+int SENSOR = -1;
+int RESET = -1;
+
+// ----------------------------
+// Time Management
+// ----------------------------
+TimeHelper timeHelper; // Handles NTP updates and ISO timestamps
 
 // ----------------------------
 // JSON Document (global)
 // ----------------------------
 StaticJsonDocument<512> logDoc;
 
+// Forward declarations
+void sendLog();
+
 // ----------------------------
 // Setup Function
 // ----------------------------
 void setup()
 {
-    // Initialize logger first
+    // Initialize serial logging
     logger.begin();
     logger.info("Starting Item Counter...");
 
-    // Configure pins
-    pinMode(SENSOR_PIN, INPUT_PULLUP);
-    pinMode(RESET_PIN, INPUT_PULLUP);
+    // ----------------------------
+    // Assign and configure pins
+    // ----------------------------
+    SENSOR = pinManager.assignPin("SENSOR", UnoR4WiFi::PIN::D2);
+    RESET = pinManager.assignPin("RESET", UnoR4WiFi::PIN::D4);
+
+    pinMode(SENSOR, INPUT_PULLUP);
+    pinMode(RESET, INPUT_PULLUP);
 
     // Configure network
     network->setRemote(server, port);
     network->begin();
     network->printStatus();
 
-    // Initialize NTP client and capture start time
-    timeClient.begin();
-    timeClient.update();
-    startTimeISO = getUTCTimeISO();
+    // Initialize NTP client and capture start timestamp
+    timeHelper.begin();
 
     // Initialize HTTP logger
     postHttpLogger.begin();
@@ -87,23 +94,23 @@ void setup()
 void loop()
 {
     // --- Item Counting Logic ---
-    bool currentState = digitalRead(SENSOR_PIN);
-    if (lastState == HIGH && currentState == LOW)
+    bool currentSensorState = digitalRead(SENSOR);
+    if (lastSensorState == HIGH && currentSensorState == LOW)
     {
         itemCount++;
         logger.info("Item detected! Count = " + String(itemCount));
     }
-    lastState = currentState;
+    lastSensorState = currentSensorState;
 
     // --- Reset Button Logic ---
-    bool resetState = digitalRead(RESET_PIN);
+    bool resetState = digitalRead(RESET);
     if (lastResetState == HIGH && resetState == LOW)
     {
         logger.info("Reset pressed! Sending log...");
 
         if (network->isConnected())
         {
-            sendLog();     // Send log to Notion
+            sendLog();     // Send log to server
             itemCount = 0; // Reset counter after sending
         }
         else
@@ -113,15 +120,15 @@ void loop()
     }
     lastResetState = resetState;
 
-    // Maintain network connection
+    // Maintain network and time
     network->maintainConnection();
-    timeClient.update(); // Keep NTP client updated
+    timeHelper.update(); // Keep NTP client updated
 
     delay(10); // Small debounce delay
 }
 
 // ----------------------------
-// Send Log to Notion
+// Send Log to Server
 // ----------------------------
 void sendLog()
 {
@@ -131,16 +138,16 @@ void sendLog()
     // Database ID
     logDoc["database_id"] = DATABASE_ID;
 
-    // Simple properties
+    // Properties
     logDoc["User"] = "TestUser";
     logDoc["Count"] = itemCount;
 
     // Timestamps
     JsonObject startTs = logDoc.createNestedObject("Start Timestamp");
-    startTs["start"] = startTimeISO;
+    startTs["start"] = timeHelper.getStartTimeISO();
 
     JsonObject endTs = logDoc.createNestedObject("End Timestamp");
-    endTs["start"] = getUTCTimeISO();
+    endTs["start"] = timeHelper.getUTCTimeISO();
 
     // Notes
     logDoc["Notes"] = "Automated log entry";
@@ -150,26 +157,6 @@ void sendLog()
     serializeJson(logDoc, payload);
     logger.debug("Prepared payload: " + payload);
 
-    // Send log using PostLogHttp
+    // Send log
     postHttpLogger.log(payload);
-}
-
-// ----------------------------
-// Get UTC Time in ISO 8601
-// ----------------------------
-String getUTCTimeISO()
-{
-    time_t rawTime = timeClient.getEpochTime();
-    struct tm *timeInfo = gmtime(&rawTime);
-
-    char buffer[25];
-    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             timeInfo->tm_year + 1900,
-             timeInfo->tm_mon + 1,
-             timeInfo->tm_mday,
-             timeInfo->tm_hour,
-             timeInfo->tm_min,
-             timeInfo->tm_sec);
-
-    return String(buffer);
 }
